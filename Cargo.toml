@@ -1,0 +1,12 @@
+[package]
+name = "timezoned_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-process = "1.7.0"
+futures = "0.3.28"
+log = "0.4.17"
+maxminddb = { version = "0.17", features = ["mmap"] }
+pretty_env_logger = "0.4.0"
+tokio = { version = "1.28.0", features = ["full"] }
