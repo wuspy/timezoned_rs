@@ -1,4 +1,4 @@
-use futures::future::OptionFuture;
+use futures::stream::{unfold, StreamExt};
 use log::{debug, error, info, warn};
 use maxminddb::geoip2;
 use std::collections::HashMap;
@@ -9,9 +9,8 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::SystemTime;
 use tokio::net::UdpSocket;
-use tokio::select;
-use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Duration, Instant, Interval, MissedTickBehavior};
+use tokio::{pin, select};
 
 const ERR_TIMEZONE_NOT_FOUND: &[u8] = "ERROR Timezone Not Found".as_bytes();
 const ERR_GEOIP_LOOKUP_FAILED: &[u8] = "ERROR GeoIP Lookup Failed".as_bytes();
@@ -290,15 +289,15 @@ impl Config {
     }
 }
 
-fn create_refresh_interval(last_refreshed: Option<SystemTime>, period: Duration) -> Interval {
-    let time_since_refresh = match last_refreshed {
+fn interval(last_ran_at: Option<SystemTime>, period: Duration) -> Interval {
+    let time_since_run = match last_ran_at {
         Some(time) => SystemTime::now().duration_since(time).unwrap_or(period),
         None => period,
     };
 
     let mut interval = interval_at(
-        if time_since_refresh < period {
-            Instant::now() + period - time_since_refresh
+        if time_since_run < period {
+            Instant::now() + period - time_since_run
         } else {
             Instant::now()
         },
@@ -336,6 +335,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let timezone_refresh_task = unfold(
+        interval(TimezoneDb::refreshed_at(), config.tz_refresh_period),
+        |mut interval| async {
+            interval.tick().await;
+            Some((TimezoneDb::update().await, interval))
+        },
+    );
+    pin!(timezone_refresh_task);
+
     let mut geoip = match GeoIpDb::load() {
         Ok(geoip) => Some(geoip),
         Err(err) => {
@@ -355,20 +363,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut tz_refresh_interval =
-        create_refresh_interval(TimezoneDb::refreshed_at(), config.tz_refresh_period);
+    let geoip_refresh_task = unfold(
+        interval(GeoIpDb::refreshed_at(), config.geoip_refresh_period),
+        |mut interval| async {
+            interval.tick().await;
+            Some((GeoIpDb::update(config.mmdb_url.as_str()).await, interval))
+        },
+    );
+    pin!(geoip_refresh_task);
 
-    let mut geoip_refresh_interval =
-        create_refresh_interval(GeoIpDb::refreshed_at(), config.geoip_refresh_period);
-
-    let mut client_prune_interval =
-        create_refresh_interval(Some(SystemTime::now()), config.client_prune_period);
-
-    let mut tz_refresh_task: OptionFuture<JoinHandle<_>> = None.into();
-    let mut geoip_refresh_task: OptionFuture<JoinHandle<_>> = None.into();
+    let mut client_prune_interval = interval(Some(SystemTime::now()), config.client_prune_period);
 
     let socket = UdpSocket::bind(format!("{}:{}", config.host, config.port)).await?;
-    let mut clients: HashMap<IpAddr, Instant> = HashMap::new();
+    let mut clients = HashMap::<IpAddr, Instant>::new();
     let mut buf = [0u8; MAX_REQUEST_SIZE];
 
     info!("Server is listening on {}", socket.local_addr().unwrap());
@@ -376,53 +383,33 @@ async fn run() -> Result<(), Box<dyn Error>> {
     loop {
         select! {
             biased;
-            // Refresh timezone data asynchronously every tz_refresh_interval
-            _ = tz_refresh_interval.tick() => {
-                tz_refresh_task = Some(tokio::spawn(TimezoneDb::update())).into();
-            },
-            Some(result) = &mut tz_refresh_task => {
-                tz_refresh_task = None.into(); // Clear completed task
-                match result {
-                    Ok(Ok(_)) => match TimezoneDb::load() {
-                        Ok(new_timezones) => {
-                            info!("Timezone database refresh complete");
-                            timezones = new_timezones;
-                        },
-                        Err(err) => {
-                            error!("Timezone database refresh completed successfully, but the new data could not be loaded");
-                            error!("Cause: {}", err);
-                        },
+            // Reload timezone data
+            Some(result) = timezone_refresh_task.next() => match result {
+                Ok(()) => match TimezoneDb::load() {
+                    Ok(new_timezones) => {
+                        info!("Timezone database refresh complete");
+                        timezones = new_timezones;
                     },
-                    Ok(Err(err)) => error!("Timezone database refresh failed: {}", err),
-                    Err(err) => std::panic::resume_unwind(err.into_panic()),
-                }
-            },
-            // Refresh GeoIP data asynchronously every geoip_refresh_interval
-            _ = geoip_refresh_interval.tick() => {
-                let mmdb_url = config.mmdb_url.to_owned();
-                // Don't start job if mmdb_url isn't configured
-                if mmdb_url.len() > 0 {
-                    geoip_refresh_task = Some(tokio::spawn(async move {
-                        GeoIpDb::update(mmdb_url.as_str()).await
-                    })).into();
-                }
-            },
-            Some(result) = &mut geoip_refresh_task => {
-                geoip_refresh_task = None.into(); // Clear completed task
-                match result {
-                    Ok(Ok(_)) => match GeoIpDb::load() {
-                        Ok(new_geoip) => {
-                            info!("GeoIP database refresh complete");
-                            geoip.replace(new_geoip);
-                        },
-                        Err(err) => {
-                            error!("GeoIP database refresh completed successfully, but the new data could not be loaded");
-                            error!("Cause: {}", err);
-                        },
+                    Err(err) => {
+                        error!("Timezone database refresh completed successfully, but the new data could not be loaded");
+                        error!("Cause: {}", err);
                     },
-                    Ok(Err(err)) => error!("GeoIP database refresh failed: {}", err),
-                    Err(err) => std::panic::resume_unwind(err.into_panic()),
-                }
+                },
+                Err(err) => error!("Timezone database refresh failed: {}", err),
+            },
+            // Reload GeoIP data
+            Some(result) = geoip_refresh_task.next(), if config.mmdb_url.len() > 0 => match result {
+                Ok(()) => match GeoIpDb::load() {
+                    Ok(new_geoip) => {
+                        info!("GeoIP database refresh complete");
+                        geoip.replace(new_geoip);
+                    },
+                    Err(err) => {
+                        error!("GeoIP database refresh completed successfully, but the new data could not be loaded");
+                        error!("Cause: {}", err);
+                    },
+                },
+                Err(err) => error!("GeoIP database refresh failed: {}", err),
             },
             // Prune clients that haven't sent requests within the rate limit window every client_prune_interval
             now = client_prune_interval.tick() => {
