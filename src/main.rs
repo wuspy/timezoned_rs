@@ -22,8 +22,8 @@ const ERR_COUNTRY_SPANS_MULTIPLE_TIMEZONES: &[u8] =
 const MAX_REQUEST_SIZE: usize = 512;
 const SECONDS_PER_DAY: u64 = 86400;
 
-const UPDATE_TZDATA_SH_PATH: &str = "/home/timezoned/update_tzdata.sh";
-const UPDATE_MMDB_SH_PATH: &str = "/home/timezoned/update_mmdb.sh";
+const UPDATE_TZDATA_SH_PATH: &str = "./update_tzdata.sh";
+const UPDATE_MMDB_SH_PATH: &str = "./update_mmdb.sh";
 const POSIXINFO_PATH: &str = "/home/timezoned/posixinfo";
 const ZONETAB_PATH: &str = "/home/timezoned/zone1970.tab";
 const MMDB_CITY_PATH: &str = "/home/timezoned/GeoLite2-City.mmdb";
@@ -456,14 +456,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         Some(tzs) => if tzs.len() == 1 {
                             socket.send_to(ok(tzs[0]).as_bytes(), addr).await
                         } else {
-                            socket.send_to(&ERR_COUNTRY_SPANS_MULTIPLE_TIMEZONES, addr).await
+                            socket.send_to(ERR_COUNTRY_SPANS_MULTIPLE_TIMEZONES, addr).await
                         },
-                        None => socket.send_to(&ERR_COUNTRY_NOT_FOUND, addr).await,
+                        None => socket.send_to(ERR_COUNTRY_NOT_FOUND, addr).await,
                     };
                 } else if request == "GEOIP" {
                     let Some(geoip) = &geoip else {
                         // GeoIP database is not available
-                        socket.send_to(&ERR_GEOIP_LOOKUP_FAILED, addr).await;
+                        socket.send_to(ERR_GEOIP_LOOKUP_FAILED, addr).await;
                         continue;
                     };
 
@@ -472,13 +472,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         |olson| timezones.lookup_olson(&normalize_string(olson))
                     ) {
                         Some(tz) => socket.send_to(ok(tz).as_bytes(), addr).await,
-                        None => socket.send_to(&ERR_GEOIP_LOOKUP_FAILED, addr).await,
+                        None => socket.send_to(ERR_GEOIP_LOOKUP_FAILED, addr).await,
                     };
                 } else {
                     // Olson name lookup
                     match timezones.lookup_olson(&request) {
                         Some(tz) => socket.send_to(ok(tz).as_bytes(), addr).await,
-                        None => socket.send_to(&ERR_TIMEZONE_NOT_FOUND, addr).await,
+                        None => socket.send_to(ERR_TIMEZONE_NOT_FOUND, addr).await,
                     };
                 }
             }
