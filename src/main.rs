@@ -248,6 +248,10 @@ struct Config {
     data_dir: PathBuf,
     host: String,
     port: u16,
+    #[cfg(feature = "metrics")]
+    metrics_host: String,
+    #[cfg(feature = "metrics")]
+    metrics_port: u16,
     mmdb_url: String,
 }
 
@@ -268,6 +272,10 @@ impl Config {
             data_dir: Self::getenv::<PathBuf>("TZD_DATA_DIR", Some("/home/timezoned".into()))?,
             host: Self::getenv::<String>("TZD_HOST", Some("0.0.0.0".into()))?,
             port: Self::getenv::<u16>("TZD_PORT", Some(2342))?,
+            #[cfg(feature = "metrics")]
+            metrics_host: Self::getenv::<String>("TZD_METRICS_HOST", Some("0.0.0.0".into()))?,
+            #[cfg(feature = "metrics")]
+            metrics_port: Self::getenv::<u16>("TZD_METRICS_PORT", Some(0))?,
             mmdb_url: Self::getenv::<String>("TZD_MMDB_URL", Some("".into()))?,
         })
     }
@@ -318,6 +326,13 @@ fn interval(last_ran_at: Option<SystemTime>, period: Duration) -> Interval {
 
 fn ok(tz: &Timezone) -> String {
     format!("OK {} {}", tz.olson, tz.posix)
+}
+
+macro_rules! log_request {
+    ($type:expr$(, $label:expr => $value:expr)*) => {
+        #[cfg(feature = "metrics")]
+        metrics::increment_counter!("requests", "type" => $type$(, $label => $value)*);
+    };
 }
 
 #[allow(unused_must_use)]
@@ -382,11 +397,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let mut client_prune_interval = interval(Some(SystemTime::now()), config.client_prune_period);
 
+    info!("Binding UDP socket {}:{}", config.host, config.port);
     let socket = UdpSocket::bind(format!("{}:{}", config.host, config.port)).await?;
     let mut clients = HashMap::<IpAddr, Instant>::new();
     let mut buf = [0u8; MAX_REQUEST_SIZE];
 
-    info!("Server is listening on {}", socket.local_addr().unwrap());
+    #[cfg(feature = "metrics")]
+    if config.metrics_port > 0 {
+        info!(
+            "Initializing prometheus exporter on {}:{}/metrics",
+            config.metrics_host, config.metrics_port
+        );
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(std::net::SocketAddr::new(
+                IpAddr::from_str(&config.metrics_host)?,
+                config.metrics_port,
+            ))
+            .install()?;
+
+        metrics::describe_counter!("requests", "Total requests received by the server");
+    }
+
+    info!("Server is ready");
 
     loop {
         select! {
@@ -431,12 +463,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
                 // Don't respond to clients sending requests over MAX_REQUEST_SIZE
                 if len == MAX_REQUEST_SIZE {
+                    log_request!("too_large");
                     continue;
                 }
 
                 // Don't respond to rate limited clients
                 if let Some(last_client_message) = clients.get(&addr.ip()) {
                     if now - *last_client_message < config.rate_limit {
+                        log_request!("rate_limited");
                         continue;
                     }
                 }
@@ -449,15 +483,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     // 2-letter country code lookup
                     match timezones.lookup_country(&request) {
                         Some(tzs) => if tzs.len() == 1 {
+                            log_request!("country", "country" => request, "timezone" => tzs[0].olson.to_owned());
                             socket.send_to(ok(tzs[0]).as_bytes(), addr).await
                         } else {
+                            log_request!("country", "country" => request, "timezone" => "not_found");
                             socket.send_to(ERR_COUNTRY_SPANS_MULTIPLE_TIMEZONES, addr).await
                         },
-                        None => socket.send_to(ERR_COUNTRY_NOT_FOUND, addr).await,
+                        None => {
+                            log_request!("country", "country" => "not_found");
+                            socket.send_to(ERR_COUNTRY_NOT_FOUND, addr).await
+                        },
                     };
                 } else if request == "GEOIP" {
                     let Some(geoip) = &geoip else {
                         // GeoIP database is not available
+                        log_request!("geoip", "timezone" => "not_found");
                         socket.send_to(ERR_GEOIP_LOOKUP_FAILED, addr).await;
                         continue;
                     };
@@ -466,14 +506,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     match geoip.lookup_timezone(addr.ip()).and_then(
                         |olson| timezones.lookup_olson(&normalize_string(olson))
                     ) {
-                        Some(tz) => socket.send_to(ok(tz).as_bytes(), addr).await,
-                        None => socket.send_to(ERR_GEOIP_LOOKUP_FAILED, addr).await,
+                        Some(tz) => {
+                            log_request!("geoip", "timezone" => tz.olson.to_owned());
+                            socket.send_to(ok(tz).as_bytes(), addr).await
+                        },
+                        None => {
+                            log_request!("geoip", "timezone" => "not_found");
+                            socket.send_to(ERR_GEOIP_LOOKUP_FAILED, addr).await
+                        },
                     };
                 } else {
                     // Olson name lookup
                     match timezones.lookup_olson(&request) {
-                        Some(tz) => socket.send_to(ok(tz).as_bytes(), addr).await,
-                        None => socket.send_to(ERR_TIMEZONE_NOT_FOUND, addr).await,
+                        Some(tz) => {
+                            log_request!("timezone", "timezone" => tz.olson.to_owned());
+                            socket.send_to(ok(tz).as_bytes(), addr).await
+                        },
+                        None => {
+                            log_request!("timezone", "timezone" => "not_found");
+                            socket.send_to(ERR_TIMEZONE_NOT_FOUND, addr).await
+                        },
                     };
                 }
             }
