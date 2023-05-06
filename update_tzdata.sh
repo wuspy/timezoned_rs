@@ -1,34 +1,37 @@
 #!/bin/sh
 
-rm -rf ~timezoned/tzdata
-mkdir ~timezoned/tzdata
+DIR=$1
 
-rm -rf ~timezoned/zoneinfo
-mkdir ~timezoned/zoneinfo
+echo Using data directory $DIR
 
-cd ~timezoned/tzdata || exit 1
+cd $DIR || exit 1
+
+rm -rf zoneinfo
+mkdir zoneinfo || exit 1
+
+rm -rf tzdata
+mkdir tzdata && cd tzdata || exit 1
 
 wget ftp://ftp.iana.org/tz/tzdata-latest.tar.gz || exit 1
 tar zxf tzdata-latest.tar.gz || exit 1
 rm tzdata-latest.tar.gz
-mv zone1970.tab ~timezoned
+mv zone1970.tab $DIR
 for i in africa antarctica asia australasia etcetera europe northamerica southamerica; do
-	zic -d ~timezoned/zoneinfo $i;
+	zic -d $DIR/zoneinfo $i;
 done
 
-rm ~timezoned/posixinfo
-
-cd ~timezoned/zoneinfo
+cd $DIR
+rm posixinfo
+cd zoneinfo
 for i in `find *|grep /`
 do
 	if [ -f $i ]; then
-		echo -n $i  >> ~timezoned/posixinfo
-		echo -n " " >> ~timezoned/posixinfo
-		tail -1 $i  >> ~timezoned/posixinfo
+		echo -n $i  >> $DIR/posixinfo
+		echo -n " " >> $DIR/posixinfo
+		tail -1 $i  >> $DIR/posixinfo
 	fi
 done
 
-cd ~timezoned
-rm -rf ~timezoned/zoneinfo
-rm -rf ~timezoned/tzdata
-
+cd $DIR
+rm -rf zoneinfo
+rm -rf tzdata

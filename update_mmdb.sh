@@ -1,11 +1,16 @@
 #!/bin/sh
 
-rm -rf ~timezoned/mmdb
-mkdir ~timezoned/mmdb
+DIR=$1
+URL=$2
 
-cd ~timezoned/mmdb || exit 1
+echo Using data directory $DIR
 
-wget $1 || exit 1
+cd $DIR || exit 1
+
+rm -rf mmdb
+mkdir mmdb && cd mmdb || exit 1
+
+wget $URL || exit 1
 
 if [ -f *.tar.gz ]; then
 	tar zxf *.tar.gz
@@ -17,7 +22,6 @@ if [ ! -f GeoLite2-City.mmdb ]; then
 	exit 1
 fi
 
-mv GeoLite2-City.mmdb ~timezoned
-cd ~timezoned
-rm -rf ~timezoned/mmdb
-
+mv GeoLite2-City.mmdb $DIR/GeoLite2-City.mmdb.new || exit 1
+cd $DIR
+rm -rf mmdb

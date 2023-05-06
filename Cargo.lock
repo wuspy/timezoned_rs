@@ -670,6 +670,7 @@ dependencies = [
  "futures",
  "log",
  "maxminddb",
+ "memmap",
  "pretty_env_logger",
  "tokio",
 ]

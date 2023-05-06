@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 use tokio::net::UdpSocket;
@@ -23,9 +24,21 @@ const SECONDS_PER_DAY: u64 = 86400;
 
 const UPDATE_TZDATA_SH_PATH: &str = "./update_tzdata.sh";
 const UPDATE_MMDB_SH_PATH: &str = "./update_mmdb.sh";
-const POSIXINFO_PATH: &str = "/home/timezoned/posixinfo";
-const ZONETAB_PATH: &str = "/home/timezoned/zone1970.tab";
-const MMDB_CITY_PATH: &str = "/home/timezoned/GeoLite2-City.mmdb";
+const POSIXINFO_FILE: &str = "posixinfo";
+const ZONETAB_FILE: &str = "zone1970.tab";
+const MMDB_CITY_FILE: &str = "GeoLite2-City.mmdb";
+
+macro_rules! sh {
+    ($path:expr, $($arg:expr),*) => {
+        async {
+            use async_process::Command;
+            match Command::new("sh").arg($path)$(.arg($arg))*.status().await? {
+                status if !status.success() => Err(format!("{}", status).into()),
+                _ => Ok(()),
+            }
+        }
+    };
+}
 
 #[derive(Debug)]
 struct Timezone {
@@ -41,20 +54,22 @@ struct TimezoneDb {
 }
 
 impl TimezoneDb {
-    async fn update() -> Result<(), String> {
+    async fn update(config: &Config) -> Result<(), Box<dyn Error>> {
         info!("Updating timezone database...");
-        run_script(UPDATE_TZDATA_SH_PATH, []).await
+        sh!(UPDATE_TZDATA_SH_PATH, &config.data_dir).await
     }
 
-    fn load() -> Result<Self, String> {
+    fn load(config: &Config) -> Result<Self, Box<dyn Error>> {
         let mut db = TimezoneDb {
             timezones: Vec::new(),
             olson_map: HashMap::new(),
             country_map: HashMap::new(),
         };
 
-        info!("Loading timezones from {}", POSIXINFO_PATH);
-        for line in read_file_lines(POSIXINFO_PATH)? {
+        // Read timezones
+        let posixinfo = config.data_path(POSIXINFO_FILE);
+        info!("Loading timezones from {}", posixinfo.display());
+        for line in read_file_lines(posixinfo)? {
             let [olson, posix] = line.split_whitespace().collect::<Vec<_>>()[..] else {
                 warn!("posixinfo entry is improperly formatted, skipping: {}", line);
                 continue;
@@ -64,8 +79,9 @@ impl TimezoneDb {
         info!("{} timezones loaded", db.timezones.len());
 
         // Read countries
-        info!("Loading countries from {}", ZONETAB_PATH);
-        for line in read_file_lines(ZONETAB_PATH)? {
+        let zonetab = config.data_path(ZONETAB_FILE);
+        info!("Loading countries from {}", zonetab.display());
+        for line in read_file_lines(zonetab)? {
             if line.starts_with('#') {
                 continue;
             }
@@ -104,8 +120,8 @@ impl TimezoneDb {
         Ok(db)
     }
 
-    fn refreshed_at() -> Option<SystemTime> {
-        file_last_modified(POSIXINFO_PATH).ok()
+    fn refreshed_at(config: &Config) -> Option<SystemTime> {
+        file_last_modified(config.data_path(POSIXINFO_FILE)).ok()
     }
 
     fn add_timezone(&mut self, olson: &str, posix: &str) -> Result<(), String> {
@@ -117,6 +133,8 @@ impl TimezoneDb {
         if self.olson_map.contains_key(&key) {
             return Err(format!("Timezone '{}' already added to database", olson));
         }
+
+        debug!("Adding timezone {} {}", olson, posix);
         self.timezones.push(entry);
         self.olson_map.insert(key, self.timezones.len() - 1);
         Ok(())
@@ -137,6 +155,7 @@ impl TimezoneDb {
             ));
         }
 
+        debug!("Adding country {} to {}", country, olson);
         vec.push(*index);
         Ok(())
     }
@@ -166,25 +185,35 @@ impl TimezoneDb {
 }
 
 struct GeoIpDb {
-    reader: maxminddb::Reader<Vec<u8>>,
+    reader: maxminddb::Reader<memmap::Mmap>,
 }
 
 impl GeoIpDb {
-    async fn update(mmdb_url: &str) -> Result<(), String> {
+    async fn update(config: &Config) -> Result<(), Box<dyn Error>> {
         info!("Updating GeoIP database...");
-        run_script(UPDATE_MMDB_SH_PATH, [mmdb_url]).await
+        sh!(UPDATE_MMDB_SH_PATH, &config.data_dir, &config.mmdb_url).await
     }
 
-    fn load() -> Result<Self, Box<dyn Error>> {
-        info!("Loading GeoIP database from {}", MMDB_CITY_PATH);
+    fn load(config: &Config) -> Result<Self, Box<dyn Error>> {
+        let path = config.data_path(MMDB_CITY_FILE);
+        let new_path = config.data_path(format!("{}.new", MMDB_CITY_FILE));
+        info!("Loading GeoIP database from {}", path.display());
+        if new_path.exists() {
+            info!("Replacing database with {}", new_path.display());
+            if let Err(err) = fs::rename(&new_path, &path) {
+                error!("Failed to replace {}: {}", path.display(), err);
+                error!("The existing database will be used instead");
+            }
+        }
         Ok(GeoIpDb {
-            // TODO maybe use mmap?
-            reader: maxminddb::Reader::open_readfile(MMDB_CITY_PATH)?,
+            reader: maxminddb::Reader::open_mmap(path)?,
         })
     }
 
-    fn refreshed_at() -> Option<SystemTime> {
-        file_last_modified(MMDB_CITY_PATH).ok()
+    fn refreshed_at(config: &Config) -> Option<SystemTime> {
+        file_last_modified(config.data_path(format!("{}.new", MMDB_CITY_FILE)))
+            .or_else(|_| file_last_modified(config.data_path(MMDB_CITY_FILE)))
+            .ok()
     }
 
     fn lookup_timezone(&self, addr: IpAddr) -> Option<&str> {
@@ -199,39 +228,15 @@ fn normalize_string(request: &str) -> String {
     request.trim().to_uppercase().replace(' ', "_")
 }
 
-fn read_file_lines(filename: &str) -> Result<impl Iterator<Item = String>, String> {
-    let file = fs::File::open(filename)
-        .map_err(|err| format!("Failed to open from '{}': {}", filename, err))?;
+fn read_file_lines<P: AsRef<Path>>(filename: P) -> io::Result<impl Iterator<Item = String>> {
+    let file = fs::File::open(filename.as_ref())?;
     Ok(io::BufReader::new(file)
         .lines()
         .filter_map(|line| line.ok()))
 }
 
-fn file_last_modified(filename: &str) -> Result<SystemTime, String> {
-    fs::metadata(filename)
-        .and_then(|metadata| metadata.modified())
-        .map_err(|err| format!("Failed to read time modified for '{}': {}", filename, err))
-}
-
-async fn run_script<'a, I>(filename: &'a str, args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    use async_process::Command;
-
-    info!("sh {}", filename);
-    let status = Command::new("sh")
-        .arg(filename)
-        .args(args)
-        .status()
-        .await
-        .map_err(|err| format!("{}", err))?;
-
-    if !status.success() {
-        return Err(format!("{}", status));
-    }
-
-    Ok(())
+fn file_last_modified<P: AsRef<Path>>(filename: P) -> io::Result<SystemTime> {
+    fs::metadata(filename.as_ref()).and_then(|metadata| metadata.modified())
 }
 
 #[derive(Debug)]
@@ -240,6 +245,7 @@ struct Config {
     client_prune_period: Duration,
     tz_refresh_period: Duration,
     geoip_refresh_period: Duration,
+    data_dir: PathBuf,
     host: String,
     port: u16,
     mmdb_url: String,
@@ -259,16 +265,18 @@ impl Config {
             geoip_refresh_period: Duration::from_secs(
                 Self::getenv("TZD_GEOIP_REFRESH_DAYS", Some(7))? * SECONDS_PER_DAY,
             ),
+            data_dir: Self::getenv::<PathBuf>("TZD_DATA_DIR", Some("/home/timezoned".into()))?,
             host: Self::getenv::<String>("TZD_HOST", Some("127.0.0.1".into()))?,
             port: Self::getenv::<u16>("TZD_PORT", Some(2342))?,
             mmdb_url: Self::getenv::<String>("TZD_GEOIP_URL", Some("".into()))?,
         })
     }
 
-    fn getenv<T>(key: &str, default: Option<T>) -> Result<T, String>
-    where
-        T: FromStr,
-    {
+    fn data_path<P: AsRef<Path>>(&self, p: P) -> PathBuf {
+        self.data_dir.join(p)
+    }
+
+    fn getenv<T: FromStr>(key: &str, default: Option<T>) -> Result<T, String> {
         match std::env::var(key) {
             Ok(value) => value.parse::<T>().map_err(|_| {
                 format!(
@@ -322,29 +330,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
         warn!("Rate-limiting is disabled");
     }
 
-    let mut timezones = match TimezoneDb::load() {
+    let mut timezones = match TimezoneDb::load(&config) {
         Ok(timezones) => timezones,
         Err(err) => {
             warn!("Could not load timezone database: {}", err);
             warn!("Timezone database must first be loaded before the server can accept requests");
-            TimezoneDb::update()
+            TimezoneDb::update(&config)
                 .await
                 .map_err(|err| format!("Timezone database refresh failed: {}", err))?;
-            TimezoneDb::load()
+            TimezoneDb::load(&config)
                 .map_err(|err| format!("Could not initialize timezone database: {}", err))?
         }
     };
 
     let timezone_refresh_task = unfold(
-        interval(TimezoneDb::refreshed_at(), config.tz_refresh_period),
+        interval(TimezoneDb::refreshed_at(&config), config.tz_refresh_period),
         |mut interval| async {
             interval.tick().await;
-            Some((TimezoneDb::update().await, interval))
+            Some((TimezoneDb::update(&config).await, interval))
         },
     );
     pin!(timezone_refresh_task);
 
-    let mut geoip = match GeoIpDb::load() {
+    let mut geoip = match GeoIpDb::load(&config) {
         Ok(geoip) => Some(geoip),
         Err(err) => {
             warn!("Could not load GeoIP database: {}", err);
@@ -364,10 +372,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let geoip_refresh_task = unfold(
-        interval(GeoIpDb::refreshed_at(), config.geoip_refresh_period),
+        interval(GeoIpDb::refreshed_at(&config), config.geoip_refresh_period),
         |mut interval| async {
             interval.tick().await;
-            Some((GeoIpDb::update(config.mmdb_url.as_str()).await, interval))
+            Some((GeoIpDb::update(&config).await, interval))
         },
     );
     pin!(geoip_refresh_task);
@@ -385,7 +393,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             biased;
             // Reload timezone data
             Some(result) = timezone_refresh_task.next() => match result {
-                Ok(()) => match TimezoneDb::load() {
+                Ok(()) => match TimezoneDb::load(&config) {
                     Ok(new_timezones) => {
                         info!("Timezone database refresh complete");
                         timezones = new_timezones;
@@ -399,7 +407,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             },
             // Reload GeoIP data
             Some(result) = geoip_refresh_task.next(), if config.mmdb_url.len() > 0 => match result {
-                Ok(()) => match GeoIpDb::load() {
+                Ok(()) => match GeoIpDb::load(&config) {
                     Ok(new_geoip) => {
                         info!("GeoIP database refresh complete");
                         geoip.replace(new_geoip);
