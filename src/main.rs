@@ -163,21 +163,19 @@ impl TimezoneDb {
     fn lookup_olson(&self, normalized_olson: &str) -> Option<&Timezone> {
         self.olson_map
             .get(normalized_olson)
-            .map(|index| self.timezones.get(*index))
-            .flatten()
+            .and_then(|index| self.timezones.get(*index))
     }
 
     fn lookup_olson_mut(&mut self, normalized_olson: &str) -> Option<&mut Timezone> {
         self.olson_map
             .get(normalized_olson)
-            .map(|index| self.timezones.get_mut(*index))
-            .flatten()
+            .and_then(|index| self.timezones.get_mut(*index))
     }
 
     fn lookup_country(&self, normalized_country: &str) -> Option<Vec<&Timezone>> {
         self.country_map.get(normalized_country).map(|indicies| {
             indicies
-                .into_iter()
+                .iter()
                 .filter_map(|index| self.timezones.get(*index))
                 .collect::<Vec<_>>()
         })
@@ -371,7 +369,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Ok(geoip) => Some(geoip),
         Err(err) => {
             warn!("Could not load GeoIP database: {}", err);
-            if config.mmdb_url.len() > 0 {
+            if !config.mmdb_url.is_empty() {
                 warn!(
                     "Until the GeoIP database is loaded, every GeoIP request will return '{}'",
                     String::from_utf8_lossy(ERR_TIMEZONE_NOT_FOUND)
@@ -438,7 +436,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 Err(err) => error!("Timezone database refresh failed: {}", err),
             },
             // Reload GeoIP data
-            Some(result) = geoip_refresh_task.next(), if config.mmdb_url.len() > 0 => match result {
+            Some(result) = geoip_refresh_task.next(), if !config.mmdb_url.is_empty() => match result {
                 Ok(()) => match GeoIpDb::load(&config) {
                     Ok(new_geoip) => {
                         info!("GeoIP database refresh complete");
