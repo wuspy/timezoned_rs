@@ -254,7 +254,7 @@ struct Config {
 impl Config {
     fn load() -> Result<Self, String> {
         Ok(Config {
-            rate_limit: Duration::from_secs(Self::getenv("TZD_RATELIMIT_SECONDS", Some(3))?),
+            rate_limit: Duration::from_millis(Self::getenv("TZD_RATELIMIT_MS", Some(3000))?),
             client_prune_period: Duration::from_secs(Self::getenv(
                 "TZD_CLIENT_PRUNE_SECONDS",
                 Some(10),
@@ -266,9 +266,9 @@ impl Config {
                 Self::getenv("TZD_GEOIP_REFRESH_DAYS", Some(7))? * SECONDS_PER_DAY,
             ),
             data_dir: Self::getenv::<PathBuf>("TZD_DATA_DIR", Some("/home/timezoned".into()))?,
-            host: Self::getenv::<String>("TZD_HOST", Some("127.0.0.1".into()))?,
+            host: Self::getenv::<String>("TZD_HOST", Some("0.0.0.0".into()))?,
             port: Self::getenv::<u16>("TZD_PORT", Some(2342))?,
-            mmdb_url: Self::getenv::<String>("TZD_GEOIP_URL", Some("".into()))?,
+            mmdb_url: Self::getenv::<String>("TZD_MMDB_URL", Some("".into()))?,
         })
     }
 
