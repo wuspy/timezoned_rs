@@ -329,7 +329,7 @@ fn ok(tz: &Timezone) -> String {
 macro_rules! log_request {
     ($type:expr$(, $label:expr => $value:expr)*) => {
         #[cfg(feature = "metrics")]
-        metrics::increment_counter!("requests", "type" => $type$(, $label => $value)*);
+        metrics::increment_counter!("timezoned_requests", "type" => $type$(, $label => $value)*);
     };
 }
 
@@ -413,7 +413,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ))
             .install()?;
 
-        metrics::describe_counter!("requests", "Total requests received by the server");
+        metrics::describe_counter!("timezoned_requests", "Total requests received by the server");
     }
 
     info!("Server is ready");
