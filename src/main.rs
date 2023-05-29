@@ -28,6 +28,7 @@ const POSIXINFO_FILE: &str = "posixinfo";
 const ZONETAB_FILE: &str = "zone1970.tab";
 const MMDB_CITY_FILE: &str = "GeoLite2-City.mmdb";
 
+// Simple macro to run a shell script using async_process
 macro_rules! sh {
     ($path:expr, $($arg:expr),*) => {
         async {
@@ -37,6 +38,14 @@ macro_rules! sh {
                 _ => Ok(()),
             }
         }
+    };
+}
+
+// Macro to increment a prometheus counter under timezoned_requests
+macro_rules! log_request {
+    ($type:expr$(, $label:expr => $value:expr)*) => {
+        #[cfg(feature = "metrics")]
+        metrics::increment_counter!("timezoned_requests", "type" => $type$(, $label => $value)*);
     };
 }
 
@@ -183,7 +192,7 @@ impl TimezoneDb {
 }
 
 struct GeoIpDb {
-    reader: maxminddb::Reader<memmap::Mmap>,
+    reader: maxminddb::Reader<maxminddb::Mmap>,
 }
 
 impl GeoIpDb {
@@ -326,23 +335,18 @@ fn ok(tz: &Timezone) -> String {
     format!("OK {} {}", tz.olson, tz.posix)
 }
 
-macro_rules! log_request {
-    ($type:expr$(, $label:expr => $value:expr)*) => {
-        #[cfg(feature = "metrics")]
-        metrics::increment_counter!("timezoned_requests", "type" => $type$(, $label => $value)*);
-    };
-}
-
 #[allow(unused_must_use)]
 async fn run() -> Result<(), Box<dyn Error>> {
     info!("Initializing");
 
+    // Load config
     let config = Config::load()?;
     debug!("{:#?}", config);
     if config.rate_limit.is_zero() {
         warn!("Rate-limiting is disabled");
     }
 
+    // Load timezone database
     let mut timezones = match TimezoneDb::load(&config) {
         Ok(timezones) => timezones,
         Err(err) => {
@@ -356,6 +360,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    // Create task to refresh the timezone database every tz_refresh_period
     let timezone_refresh_task = unfold(
         interval(TimezoneDb::refreshed_at(&config), config.tz_refresh_period),
         |mut interval| async {
@@ -365,25 +370,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     pin!(timezone_refresh_task);
 
+    // Load GeoIP database
     let mut geoip = match GeoIpDb::load(&config) {
         Ok(geoip) => Some(geoip),
         Err(err) => {
             warn!("Could not load GeoIP database: {}", err);
-            if !config.mmdb_url.is_empty() {
-                warn!(
-                    "Until the GeoIP database is loaded, every GeoIP request will return '{}'",
-                    String::from_utf8_lossy(ERR_TIMEZONE_NOT_FOUND)
-                );
-            } else {
+            if config.mmdb_url.is_empty() {
                 warn!(
                     "GeoIP database refresh is disabled. Every GeoIP request will return '{}'",
                     String::from_utf8_lossy(ERR_TIMEZONE_NOT_FOUND)
                 );
+            } else {
+                warn!(
+                    "Until the GeoIP database is loaded, every GeoIP request will return '{}'",
+                    String::from_utf8_lossy(ERR_TIMEZONE_NOT_FOUND)
+                );
+                warn!("A GeoIP refresh will be scheduled for immediately after the server has started");
             }
             None
         }
     };
 
+    // Create task to refresh the GeoIP database every geoip_refresh_period
     let geoip_refresh_task = unfold(
         interval(GeoIpDb::refreshed_at(&config), config.geoip_refresh_period),
         |mut interval| async {
@@ -393,11 +401,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     pin!(geoip_refresh_task);
 
+    // Maps IP addresses to the time the last message was sent to them
+    let mut clients = HashMap::<IpAddr, Instant>::new();
+    // This interval triggers a task to prune clients that haven't sent a message within the rate limit window,
+    // to prevent using excessive RAM
     let mut client_prune_interval = interval(Some(SystemTime::now()), config.client_prune_period);
 
     info!("Binding UDP socket {}:{}", config.host, config.port);
     let socket = UdpSocket::bind(format!("{}:{}", config.host, config.port)).await?;
-    let mut clients = HashMap::<IpAddr, Instant>::new();
+    // Receive buffer
     let mut buf = [0u8; MAX_REQUEST_SIZE];
 
     #[cfg(feature = "metrics")]
@@ -413,7 +425,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ))
             .install()?;
 
-        metrics::describe_counter!("timezoned_requests", "Total requests received by the server");
+        metrics::describe_counter!(
+            "timezoned_requests",
+            "Total requests received by the server"
+        );
     }
 
     info!("Server is ready");
@@ -457,8 +472,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             },
             // UDP request handler
             Ok((len, addr)) = socket.recv_from(&mut buf) => {
-                let now = Instant::now();
-
                 // Don't respond to clients sending requests over MAX_REQUEST_SIZE
                 if len == MAX_REQUEST_SIZE {
                     log_request!("too_large");
@@ -466,8 +479,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 // Don't respond to rate limited clients
-                if let Some(last_client_message) = clients.get(&addr.ip()) {
-                    if now - *last_client_message < config.rate_limit {
+                let now = Instant::now();
+                if let Some(last_client_response) = clients.get(&addr.ip()) {
+                    if now - *last_client_response < config.rate_limit {
                         log_request!("rate_limited");
                         continue;
                     }
@@ -493,6 +507,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         },
                     };
                 } else if request == "GEOIP" {
+                    // GeoIP lookup
                     let Some(geoip) = &geoip else {
                         // GeoIP database is not available
                         log_request!("geoip", "timezone" => "not_found");
@@ -500,7 +515,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         continue;
                     };
 
-                    // GeoIP lookup
                     match geoip.lookup_timezone(addr.ip()).and_then(
                         |olson| timezones.lookup_olson(&normalize_string(olson))
                     ) {
