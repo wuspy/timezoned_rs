@@ -2,7 +2,7 @@
 
 DIR=$1
 
-echo Using data directory $DIR
+echo update_tzdata: Using data directory $DIR
 
 cd $DIR || exit 1
 
@@ -12,7 +12,7 @@ mkdir zoneinfo || exit 1
 rm -rf tzdata
 mkdir tzdata && cd tzdata || exit 1
 
-wget ftp://ftp.iana.org/tz/tzdata-latest.tar.gz || exit 1
+wget -nv ftp://ftp.iana.org/tz/tzdata-latest.tar.gz || exit 1
 tar zxf tzdata-latest.tar.gz || exit 1
 rm tzdata-latest.tar.gz
 mv zone1970.tab $DIR
