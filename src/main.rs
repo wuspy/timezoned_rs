@@ -547,6 +547,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::var("TZD_LOG").is_err() {
+        std::env::set_var("TZD_LOG", "info");
+    }
     pretty_env_logger::init_custom_env("TZD_LOG");
 
     match run().await {
