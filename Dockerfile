@@ -1,4 +1,4 @@
-FROM rust:1.69-bullseye as builder
+FROM rust:1.70-bullseye as builder
 WORKDIR /usr/src/timezoned_rs
 COPY . .
 RUN cargo install --path .
