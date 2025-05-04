@@ -45,7 +45,7 @@ macro_rules! sh {
 macro_rules! log_request {
     ($type:expr$(, $label:expr => $value:expr)*) => {
         #[cfg(feature = "metrics")]
-        metrics::increment_counter!("timezoned_requests", "type" => $type$(, $label => $value)*);
+        metrics::counter!("timezoned_requests", "type" => $type$(, $label => $value)*).increment(1);
     };
 }
 
@@ -227,6 +227,7 @@ impl GeoIpDb {
         self.reader
             .lookup::<geoip2::City>(addr)
             .ok()
+            .flatten()
             .and_then(|city| city.location.and_then(|location| location.time_zone))
     }
 }
@@ -547,10 +548,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if std::env::var("TZD_LOG").is_err() {
-        std::env::set_var("TZD_LOG", "info");
-    }
-    pretty_env_logger::init_custom_env("TZD_LOG");
+    env_logger::init_from_env(
+        env_logger::Env::default().filter_or("TZD_LOG", "info")
+    );
 
     match run().await {
         Ok(_) => info!("Server has shut down"),
